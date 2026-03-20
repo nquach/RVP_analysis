@@ -11,6 +11,7 @@ Usage:
         [--deriv-smooth none|savgol|kalman] [--savgol-window N] [--savgol-polyorder P]
         [--kalman-level-noise X] [--kalman-trend-noise X] [--kalman-observation-noise X]
         [--rvp2-sq-spectral] [--rvp2-sq-spectral-fraction F] [--rvp2-sq-spectral-pad N]
+        [--disable-peak3-middle-third]
         [-v|--verbose]
 """
 
@@ -225,6 +226,17 @@ def _spectral_smooth_rvp2_sq(
         return x
 
 
+def _peak3_in_middle_third(peak3_idx: int, n: int) -> bool:
+    """True if sample index lies in the middle third of [0, n-1] (inclusive)."""
+    if n < 1:
+        return False
+    lo = n // 3
+    hi = (2 * n) // 3 - 1
+    if lo > hi:
+        return False
+    return lo <= peak3_idx <= hi
+
+
 def _find_four_peaks(
     rvp2_sq: np.ndarray, min_dist: int = 5, thres: float = 0.1
 ) -> Optional[np.ndarray]:
@@ -315,6 +327,7 @@ def analyze_one_cycle(
     co_l_per_min: float,
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
     rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
+    require_peak3_middle_third: bool = True,
 ) -> tuple[dict[str, Any], Optional[tuple]]:
     """
     Compute all metrics for one cardiac cycle. Returns (row_dict, plot_data).
@@ -330,11 +343,26 @@ def analyze_one_cycle(
     peaks = _find_four_peaks(rvp2_sq)
     if peaks is None or len(peaks) < N_PEAKS_RVP2:
         return (
-            {"cycle_ok": False, "failed_peak_detection": True},
+            {
+                "cycle_ok": False,
+                "failed_peak_detection": True,
+                "failed_peak3_middle_third": False,
+            },
             None,
         )
 
     peak1_idx, peak2_idx, peak3_idx, peak4_idx = int(peaks[0]), int(peaks[1]), int(peaks[2]), int(peaks[3])
+    n_seg = int(rvp2_sq.shape[0])
+    if require_peak3_middle_third and not _peak3_in_middle_third(peak3_idx, n_seg):
+        return (
+            {
+                "cycle_ok": False,
+                "failed_peak_detection": True,
+                "failed_peak3_middle_third": True,
+            },
+            None,
+        )
+
     idx_max_dp = int(np.argmax(rvp1))
     idx_min_dp = int(np.argmin(rvp1))
 
@@ -386,6 +414,7 @@ def analyze_one_cycle(
     row = {
         "cycle_ok": True,
         "failed_peak_detection": False,
+        "failed_peak3_middle_third": False,
         "RR_interval_sec": rr_sec,
         "HR": hr,
         "IVCT": ivct,
@@ -439,14 +468,73 @@ def segment_pressure_by_rr_with_fs(
     return segments
 
 
+def _format_metrics_row(row: dict[str, Any]) -> str:
+    """Multi-line text for diagnostic PNG from per-cycle CSV row."""
+    keys = [
+        "cycle",
+        "CO_method",
+        "CO_L_per_min",
+        "cycle_ok",
+        "failed_peak_detection",
+        "failed_peak3_middle_third",
+        "RR_interval_sec",
+        "HR",
+        "IVCT",
+        "ET",
+        "IVRT",
+        "ESP",
+        "BDP",
+        "EDP",
+        "Pmax",
+        "SV",
+        "ESV",
+        "EDV",
+        "Ees",
+        "Ea",
+        "RVEF_pct",
+        "RVMPI",
+        "beta",
+        "Eed",
+    ]
+    lines: list[str] = []
+    for k in keys:
+        if k not in row:
+            continue
+        v = row[k]
+        if v is None or (isinstance(v, (float, np.floating)) and np.isnan(float(v))):
+            lines.append(f"{k}: N/A")
+        elif isinstance(v, (float, np.floating)):
+            lines.append(f"{k}: {float(v):.5g}")
+        else:
+            lines.append(f"{k}: {v}")
+    return "\n".join(lines)
+
+
 def save_diagnostic_plot(
     plot_data: tuple,
     save_path: Path,
     cycle_num: int,
+    metrics_row: dict[str, Any],
 ) -> None:
-    """Save 3-panel diagnostic plot: RVP (+ sine), RVP', RVP''²; shared x-axis."""
+    """Save 3-panel diagnostic plot plus metrics text: RVP (+ sine), RVP', RVP''²; shared x-axis."""
     t, rvp, rvp1, rvp2_sq, peaks, pmax, t_fit, p_fit, idx_max_dp, idx_min_dp = plot_data
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, figsize=(8, 8), layout="constrained")
+    fig = plt.figure(figsize=(8, 10), layout="constrained")
+    gs = fig.add_gridspec(4, 1, height_ratios=[3.0, 3.0, 3.0, 1.5])
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
+    ax4 = fig.add_subplot(gs[3, 0])
+    ax4.axis("off")
+    ax4.text(
+        0.0,
+        1.0,
+        _format_metrics_row(metrics_row),
+        transform=ax4.transAxes,
+        va="top",
+        ha="left",
+        fontsize=6,
+        family="monospace",
+    )
     ax1.plot(t, rvp, "b-", label="RV pressure")
     if t_fit is not None and p_fit is not None:
         ax1.plot(t_fit, p_fit, "r--", alpha=0.8, label="Sine fit (IVCT+IVRT)")
@@ -485,6 +573,7 @@ def run_analysis(
     verbose: bool = False,
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
     rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
+    require_peak3_middle_third: bool = True,
 ) -> int:
     """Load HDF5, run full pipeline, write CSV and PNGs. Returns 0 on success."""
     if co_method.upper() == "TDCO":
@@ -578,6 +667,7 @@ def run_analysis(
             co_l_per_min,
             deriv_smooth=deriv_smooth,
             rvp2_sq_spectral=rvp2_sq_spectral,
+            require_peak3_middle_third=require_peak3_middle_third,
         )
         row["cycle"] = cycle_num
         row["CO_method"] = co_method
@@ -588,6 +678,7 @@ def run_analysis(
                 plot_data,
                 png_dir / f"{basename}_{cycle_num}.png",
                 cycle_num,
+                row,
             )
 
     if verbose:
@@ -698,6 +789,11 @@ def main() -> int:
         metavar="N",
         help=f"Spectral smoother: symmetric pad length at each edge. Default: {ECG_PAD_LEN} (same as ECG path)",
     )
+    parser.add_argument(
+        "--disable-peak3-middle-third",
+        action="store_true",
+        help="Disable requirement that the 3rd RVP''² peak (time-ordered) lies in the middle third of the cycle",
+    )
     args = parser.parse_args()
     h5_path = args.h5_path.resolve()
     if not h5_path.is_file():
@@ -725,6 +821,7 @@ def main() -> int:
         verbose=args.verbose,
         deriv_smooth=deriv_cfg,
         rvp2_sq_spectral=rvp2_sq_cfg,
+        require_peak3_middle_third=not args.disable_peak3_middle_third,
     )
 
 

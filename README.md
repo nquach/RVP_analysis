@@ -174,6 +174,14 @@ After derivative smoothing (if any) and squaring RVP″, you can apply a **secon
 
 Very short cycles may skip spectral smoothing with a stderr warning and use unsmoothed \((\mathrm{RVP}'')^2\).
 
+### 3rd RVP''² peak in the middle third (default)
+
+Among the four largest peaks on \((\mathrm{RVP}'')^2\) (sorted in **time order**), the **third** peak (the middle one in time) must fall in the **middle third** of the cycle’s sample indices. If not, that beat is marked as failed peak detection (`failed_peak3_middle_third` is true in the CSV). This is **on** by default.
+
+| Flag | Meaning |
+|------|---------|
+| `--disable-peak3-middle-third` | Turn off this requirement (restores behavior closer to older versions that did not check peak position). |
+
 ### HDF5 inputs the script expects
 
 - Datasets: `--ecg-lead` (default `ECG_lead_II`) and **`RHC_pressure`**.
@@ -181,8 +189,8 @@ Very short cycles may skip spectral smoothing with a stderr warning and use unsm
 
 ### Outputs
 
-- **`csv_files/{stem}.csv`**: one row per cardiac cycle attempt with columns such as cycle index, `cycle_ok`, hemodynamic intervals, volumes/pressures where fitted, and metadata (`CO_method`, `CO_L_per_min`, etc.).
-- **`png_files/{stem}_{n}.png`**: three-panel plot (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks) for cycles with `cycle_ok` True.
+- **`csv_files/{stem}.csv`**: one row per cardiac cycle attempt with columns such as cycle index, `cycle_ok`, `failed_peak_detection`, `failed_peak3_middle_third`, hemodynamic intervals, volumes/pressures where fitted, and metadata (`CO_method`, `CO_L_per_min`, etc.).
+- **`png_files/{stem}_{n}.png`**: three stacked waveform panels (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks) plus a **text block under the plots** listing the same per-cycle metrics and CO inputs for cycles with `cycle_ok` True.
 
 ---
 
@@ -217,5 +225,6 @@ python scripts/analyze_rv_pressure.py hdf5_files/TRM127-RHC1.h5 --co-method TDCO
 | Analysis: no valid cycles | R–R outside 0.4–1.5 s, or too few R-peaks; check ECG quality and `--ecg-lead`. |
 | Derivative smoothing warnings | Short segments may skip Savitzky–Golay or Kalman; warnings go to stderr. |
 | Spectral \((\mathrm{RVP}'')^2\) warnings | Very short cycles or invalid fraction/pad; falls back to unsmoothed \((\mathrm{RVP}'')^2\). |
+| Many cycles fail `failed_peak3_middle_third` | Third \((\mathrm{RVP}'')^2\) peak not in middle third of beat; try `--disable-peak3-middle-third` or improve signals / smoothing. |
 
 For full behavior (filters, peak rules, and metric definitions), see the docstrings and constants in `scripts/analyze_rv_pressure.py`.
