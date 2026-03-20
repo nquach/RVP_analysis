@@ -7,13 +7,17 @@ segments RV pressure into R-R intervals, and computes per-cycle Ees, Ea, RVEF, E
 Writes csv_files/{basename}.csv and png_files/{basename}_{cycle}.png.
 
 Usage:
-    python scripts/analyze_rv_pressure.py path/to/file.h5 [--co-method TDCO|Fick_CO] [--output-dir DIR] [-v|--verbose]
+    python scripts/analyze_rv_pressure.py path/to/file.h5 [--co-method TDCO|Fick_CO] [--output-dir DIR]
+        [--deriv-smooth none|savgol|kalman] [--savgol-window N] [--savgol-polyorder P]
+        [--kalman-level-noise X] [--kalman-trend-noise X] [--kalman-observation-noise X]
+        [-v|--verbose]
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,7 +29,8 @@ import numpy as np
 import pandas as pd
 import peakutils
 from scipy.optimize import brentq, curve_fit
-from tsmoothie.smoother import SpectralSmoother
+from scipy.signal import savgol_filter
+from tsmoothie.smoother import KalmanSmoother, SpectralSmoother
 
 # HDF5 dataset/attr names (must match extract_wfbd_to_hdf5.py)
 ECG_LEAD_II = "ECG_lead_II"
@@ -44,6 +49,25 @@ RR_MAX_SEC = 1.5
 
 # Number of prominent peaks in RVP''²
 N_PEAKS_RVP2 = 4
+
+# RVP' / RVP'' smoothing defaults (post-gradient, before peak picking)
+DEFAULT_SAVGOL_WINDOW = 11
+DEFAULT_SAVGOL_POLYORDER = 3
+DEFAULT_KALMAN_LEVEL_NOISE = 0.1
+DEFAULT_KALMAN_TREND_NOISE = 0.1
+DEFAULT_KALMAN_OBSERVATION_NOISE = 1.0
+
+
+@dataclass(frozen=True)
+class DerivativeSmoothConfig:
+    """Smoothing applied to RVP' and RVP'' after np.gradient, before RVP''² and peaks."""
+
+    method: str = "none"  # none | savgol | kalman
+    savgol_window: int = DEFAULT_SAVGOL_WINDOW
+    savgol_polyorder: int = DEFAULT_SAVGOL_POLYORDER
+    kalman_level_noise: float = DEFAULT_KALMAN_LEVEL_NOISE
+    kalman_trend_noise: float = DEFAULT_KALMAN_TREND_NOISE
+    kalman_observation_noise: float = DEFAULT_KALMAN_OBSERVATION_NOISE
 
 
 def get_project_root() -> Path:
@@ -67,11 +91,87 @@ def detect_r_waves(ecg: np.ndarray, fs: float) -> np.ndarray:
 
 
 def _derivatives(rvp: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """First and squared second derivative of RVP w.r.t. time."""
+    """First and second time derivatives of RVP (RVP', RVP'')."""
     rvp1 = np.gradient(rvp, t)
     rvp2 = np.gradient(rvp1, t)
-    rvp2_sq = rvp2 ** 2
-    return rvp1, rvp2_sq
+    return rvp1, rvp2
+
+
+def _effective_savgol_window(n: int, polyorder: int, requested: int) -> Optional[int]:
+    """Largest odd window <= min(requested, n) with window_length > polyorder, or None."""
+    if n <= 0 or polyorder < 0:
+        return None
+    max_w = min(requested, n)
+    if max_w % 2 == 0:
+        max_w -= 1
+    while max_w >= 3:
+        if max_w % 2 == 1 and max_w > polyorder:
+            return max_w
+        max_w -= 1
+    return None
+
+
+def _kalman_smooth_1d(x: np.ndarray, cfg: DerivativeSmoothConfig) -> np.ndarray:
+    """Kalman smooth a 1D series; on failure return input as float array."""
+    x = np.asarray(x, dtype=float)
+    if x.size < 3:
+        print(
+            "Warning: segment too short for Kalman derivative smoothing; using raw derivatives.",
+            file=sys.stderr,
+        )
+        return x
+    try:
+        ks = KalmanSmoother(
+            component="level_trend",
+            component_noise={
+                "level": cfg.kalman_level_noise,
+                "trend": cfg.kalman_trend_noise,
+            },
+            observation_noise=cfg.kalman_observation_noise,
+        )
+        ks.smooth(x)
+        out = np.asarray(ks.smooth_data[0], dtype=float)
+        out = np.squeeze(out)
+        if out.shape != x.shape:
+            out = out.reshape(x.shape)
+        return out
+    except Exception as e:
+        print(
+            f"Warning: Kalman derivative smoothing failed ({e}); using raw derivatives.",
+            file=sys.stderr,
+        )
+        return x
+
+
+def _smooth_derivatives(
+    rvp1: np.ndarray,
+    rvp2: np.ndarray,
+    _fs: float,
+    cfg: DerivativeSmoothConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Smooth RVP' and RVP'' in place of identity when method is none."""
+    m = (cfg.method or "none").lower()
+    if m == "none":
+        return rvp1, rvp2
+    if m == "savgol":
+        n = int(rvp1.shape[0])
+        w_req = cfg.savgol_window
+        if w_req % 2 == 0:
+            w_req += 1
+        w = _effective_savgol_window(n, cfg.savgol_polyorder, w_req)
+        if w is None:
+            print(
+                "Warning: segment too short for Savitzky-Golay derivative smoothing; using raw derivatives.",
+                file=sys.stderr,
+            )
+            return rvp1, rvp2
+        p = cfg.savgol_polyorder
+        r1 = savgol_filter(np.asarray(rvp1, dtype=float), w, p, mode="interp")
+        r2 = savgol_filter(np.asarray(rvp2, dtype=float), w, p, mode="interp")
+        return r1, r2
+    if m == "kalman":
+        return _kalman_smooth_1d(rvp1, cfg), _kalman_smooth_1d(rvp2, cfg)
+    raise ValueError(f"Unknown derivative smooth method: {cfg.method!r}")
 
 
 def _find_four_peaks(
@@ -162,12 +262,16 @@ def analyze_one_cycle(
     rr_sec: float,
     fs: float,
     co_l_per_min: float,
+    deriv_smooth: Optional[DerivativeSmoothConfig] = None,
 ) -> tuple[dict[str, Any], Optional[tuple]]:
     """
     Compute all metrics for one cardiac cycle. Returns (row_dict, plot_data).
     plot_data is (t, rvp, rvp1, rvp2_sq, peak_indices, pmax, t_fit, p_fit) for plotting.
     """
-    rvp1, rvp2_sq = _derivatives(rvp, t)
+    cfg = deriv_smooth if deriv_smooth is not None else DerivativeSmoothConfig()
+    rvp1, rvp2 = _derivatives(rvp, t)
+    rvp1, rvp2 = _smooth_derivatives(rvp1, rvp2, fs, cfg)
+    rvp2_sq = rvp2 ** 2
     peaks = _find_four_peaks(rvp2_sq)
     if peaks is None or len(peaks) < N_PEAKS_RVP2:
         return (
@@ -324,6 +428,7 @@ def run_analysis(
     output_dir: Path,
     ecg_lead: str,
     verbose: bool = False,
+    deriv_smooth: Optional[DerivativeSmoothConfig] = None,
 ) -> int:
     """Load HDF5, run full pipeline, write CSV and PNGs. Returns 0 on success."""
     if co_method.upper() == "TDCO":
@@ -378,6 +483,8 @@ def run_analysis(
         return 1
     if verbose:
         print("  {} cardiac cycles to analyze.".format(len(segments)))
+        dcfg = deriv_smooth if deriv_smooth is not None else DerivativeSmoothConfig()
+        print(f"  Derivative smoothing: {dcfg.method}.")
 
     basename = h5_path.stem
     csv_dir = output_dir / "csv_files"
@@ -400,7 +507,9 @@ def run_analysis(
         cycle_num = i + 1
         if verbose and hasattr(iterator, "set_postfix"):
             iterator.set_postfix(cycle=cycle_num, RR_s=round(rr_sec, 3))
-        row, plot_data = analyze_one_cycle(rvp, t, rr_sec, fs, co_l_per_min)
+        row, plot_data = analyze_one_cycle(
+            rvp, t, rr_sec, fs, co_l_per_min, deriv_smooth=deriv_smooth
+        )
         row["cycle"] = cycle_num
         row["CO_method"] = co_method
         row["CO_L_per_min"] = co_l_per_min
@@ -459,13 +568,70 @@ def main() -> int:
         action="store_true",
         help="Print step-by-step progress and show tqdm progress bar for cardiac cycle analysis",
     )
+    parser.add_argument(
+        "--deriv-smooth",
+        type=str,
+        default="none",
+        choices=["none", "savgol", "kalman"],
+        help="Smooth RVP' and RVP'' before peak picking: none (default), savgol, or kalman",
+    )
+    parser.add_argument(
+        "--savgol-window",
+        type=int,
+        default=DEFAULT_SAVGOL_WINDOW,
+        metavar="N",
+        help=f"Savitzky-Golay window length in samples (odd; if even, bumped). Default: {DEFAULT_SAVGOL_WINDOW}",
+    )
+    parser.add_argument(
+        "--savgol-polyorder",
+        type=int,
+        default=DEFAULT_SAVGOL_POLYORDER,
+        metavar="P",
+        help=f"Savitzky-Golay polynomial order (must be < window). Default: {DEFAULT_SAVGOL_POLYORDER}",
+    )
+    parser.add_argument(
+        "--kalman-level-noise",
+        type=float,
+        default=DEFAULT_KALMAN_LEVEL_NOISE,
+        metavar="X",
+        help=f"Kalman UCM level component noise. Default: {DEFAULT_KALMAN_LEVEL_NOISE}",
+    )
+    parser.add_argument(
+        "--kalman-trend-noise",
+        type=float,
+        default=DEFAULT_KALMAN_TREND_NOISE,
+        metavar="X",
+        help=f"Kalman UCM trend component noise. Default: {DEFAULT_KALMAN_TREND_NOISE}",
+    )
+    parser.add_argument(
+        "--kalman-observation-noise",
+        type=float,
+        default=DEFAULT_KALMAN_OBSERVATION_NOISE,
+        metavar="X",
+        help=f"Kalman observation noise. Default: {DEFAULT_KALMAN_OBSERVATION_NOISE}",
+    )
     args = parser.parse_args()
     h5_path = args.h5_path.resolve()
     if not h5_path.is_file():
         print(f"Error: file not found: {h5_path}", file=sys.stderr)
         return 1
     output_dir = args.output_dir.resolve() if args.output_dir else h5_path.parent
-    return run_analysis(h5_path, args.co_method, output_dir, args.ecg_lead, verbose=args.verbose)
+    deriv_cfg = DerivativeSmoothConfig(
+        method=args.deriv_smooth,
+        savgol_window=args.savgol_window,
+        savgol_polyorder=args.savgol_polyorder,
+        kalman_level_noise=args.kalman_level_noise,
+        kalman_trend_noise=args.kalman_trend_noise,
+        kalman_observation_noise=args.kalman_observation_noise,
+    )
+    return run_analysis(
+        h5_path,
+        args.co_method,
+        output_dir,
+        args.ecg_lead,
+        verbose=args.verbose,
+        deriv_smooth=deriv_cfg,
+    )
 
 
 if __name__ == "__main__":
