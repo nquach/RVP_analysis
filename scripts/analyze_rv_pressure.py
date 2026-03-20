@@ -4,6 +4,7 @@ Analyze RV pressure time series from HDF5: ECG-gated cardiac cycles and PV-loop 
 
 Reads user-specified HDF5 (ECG Lead II + RHC_pressure), detects R-waves (TEE_optical_flow style),
 segments RV pressure into R-R intervals, and computes per-cycle Ees, Ea, RVEF, Eed, RVMPI, beta, etc.
+Four (RVP'')² peaks are found in fixed regions of each beat (first third; then to argmin RVP'; then to argmin RVP).
 Writes csv_files/{basename}.csv and png_files/{basename}_{cycle}.png.
 
 Usage:
@@ -11,7 +12,7 @@ Usage:
         [--deriv-smooth none|savgol|kalman] [--savgol-window N] [--savgol-polyorder P]
         [--kalman-level-noise X] [--kalman-trend-noise X] [--kalman-observation-noise X]
         [--rvp2-sq-spectral] [--rvp2-sq-spectral-fraction F] [--rvp2-sq-spectral-pad N]
-        [--disable-peak3-middle-third] [--disable-peak34-negative-rvp1]
+        [--enable-peak34-negative-rvp1]
         [-v|--verbose]
 """
 
@@ -226,17 +227,6 @@ def _spectral_smooth_rvp2_sq(
         return x
 
 
-def _peak3_in_middle_third(peak3_idx: int, n: int) -> bool:
-    """True if sample index lies in the middle third of [0, n-1] (inclusive)."""
-    if n < 1:
-        return False
-    lo = n // 3
-    hi = (2 * n) // 3 - 1
-    if lo > hi:
-        return False
-    return lo <= peak3_idx <= hi
-
-
 def _peaks34_rvp1_negative(rvp1: np.ndarray, peak3_idx: int, peak4_idx: int) -> bool:
     """True if RVP' is strictly negative at the 3rd and 4th RVP''² peaks (time-ordered)."""
     a = float(rvp1[peak3_idx])
@@ -244,20 +234,79 @@ def _peaks34_rvp1_negative(rvp1: np.ndarray, peak3_idx: int, peak4_idx: int) -> 
     return a < 0.0 and b < 0.0
 
 
-def _find_four_peaks(
-    rvp2_sq: np.ndarray, min_dist: int = 5, thres: float = 0.1
+def _peaks_rvp2_sq_segment(
+    rvp2_sq: np.ndarray,
+    lo: int,
+    hi: int,
+    min_dist: int,
+    thres: float,
+) -> np.ndarray:
+    """
+    Peak indices in global coordinates within [lo, hi] inclusive.
+    Uses shorter min_dist on short segments. Falls back to global argmax if len < 3.
+    """
+    if hi < lo:
+        return np.asarray([], dtype=int)
+    seg = np.asarray(rvp2_sq[lo : hi + 1], dtype=float)
+    nloc = seg.size
+    if nloc == 0:
+        return np.asarray([], dtype=int)
+    if nloc < 3:
+        return np.asarray([lo + int(np.argmax(seg))], dtype=int)
+    md = min(min_dist, max(1, nloc // 4))
+    try:
+        local = peakutils.peak.indexes(seg, thres=thres, min_dist=md)
+    except Exception:
+        return np.asarray([], dtype=int)
+    return np.asarray(local, dtype=int) + lo
+
+
+def _find_four_peaks_regional(
+    rvp2_sq: np.ndarray,
+    idx_min_dp: int,
+    idx_min_rvp: int,
+    min_dist: int = 5,
+    thres: float = 0.1,
 ) -> Optional[np.ndarray]:
-    """Find four prominent peaks in RVP''²; return indices in order or None."""
-    peak_idx = peakutils.peak.indexes(
-        rvp2_sq, thres=thres, min_dist=min_dist
-    )
-    if len(peak_idx) < N_PEAKS_RVP2:
+    """
+    Four RVP''² peaks in time order: (1–2) first third of cycle; (3) [n/3, idx_min_dp-1];
+    (4) [idx_min_dp, idx_min_rvp]. idx_min_dp = argmin(RVP'), idx_min_rvp = argmin(RVP).
+    """
+    n = int(rvp2_sq.shape[0])
+    if n < 3:
         return None
-    # Take the four largest peaks by value, then sort by index to get order
-    values = rvp2_sq[peak_idx]
-    order = np.argsort(values)[::-1][:N_PEAKS_RVP2]
-    four = np.sort(peak_idx[order])
-    return four
+
+    hi1 = n // 3
+    if hi1 < 2:
+        return None
+    peaks12 = _peaks_rvp2_sq_segment(rvp2_sq, 0, hi1 - 1, min_dist, thres)
+    if peaks12.size < 2:
+        return None
+    top2 = np.argsort(rvp2_sq[peaks12])[::-1][:2]
+    pair = np.sort(peaks12[top2].astype(int))
+    peak1_idx, peak2_idx = int(pair[0]), int(pair[1])
+
+    lo3 = n // 3
+    hi3 = idx_min_dp - 1
+    if lo3 > hi3:
+        return None
+    peaks3_cand = _peaks_rvp2_sq_segment(rvp2_sq, lo3, hi3, min_dist, thres)
+    if peaks3_cand.size < 1:
+        return None
+    peak3_idx = int(peaks3_cand[int(np.argmax(rvp2_sq[peaks3_cand]))])
+
+    lo4 = idx_min_dp
+    hi4 = idx_min_rvp
+    if lo4 > hi4:
+        return None
+    peaks4_cand = _peaks_rvp2_sq_segment(rvp2_sq, lo4, hi4, min_dist, thres)
+    if peaks4_cand.size < 1:
+        return None
+    peak4_idx = int(peaks4_cand[int(np.argmax(rvp2_sq[peaks4_cand]))])
+
+    if not (peak1_idx < peak2_idx < peak3_idx < peak4_idx):
+        return None
+    return np.array([peak1_idx, peak2_idx, peak3_idx, peak4_idx], dtype=int)
 
 
 def _sine_model(t: np.ndarray, A: float, omega: float, phi: float, C: float) -> np.ndarray:
@@ -334,8 +383,7 @@ def analyze_one_cycle(
     co_l_per_min: float,
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
     rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
-    require_peak3_middle_third: bool = True,
-    require_peak34_rvp1_negative: bool = True,
+    require_peak34_rvp1_negative: bool = False,
 ) -> tuple[dict[str, Any], Optional[tuple]]:
     """
     Compute all metrics for one cardiac cycle. Returns (row_dict, plot_data).
@@ -348,7 +396,10 @@ def analyze_one_cycle(
     sq_cfg = rvp2_sq_spectral if rvp2_sq_spectral is not None else Rvp2SqSpectralConfig()
     if sq_cfg.enabled:
         rvp2_sq = _spectral_smooth_rvp2_sq(rvp2_sq, sq_cfg.smooth_fraction, sq_cfg.pad_len)
-    peaks = _find_four_peaks(rvp2_sq)
+
+    idx_min_dp = int(np.argmin(rvp1))
+    idx_min_rvp = int(np.argmin(rvp))
+    peaks = _find_four_peaks_regional(rvp2_sq, idx_min_dp, idx_min_rvp)
     if peaks is None or len(peaks) < N_PEAKS_RVP2:
         return (
             {
@@ -361,17 +412,6 @@ def analyze_one_cycle(
         )
 
     peak1_idx, peak2_idx, peak3_idx, peak4_idx = int(peaks[0]), int(peaks[1]), int(peaks[2]), int(peaks[3])
-    n_seg = int(rvp2_sq.shape[0])
-    if require_peak3_middle_third and not _peak3_in_middle_third(peak3_idx, n_seg):
-        return (
-            {
-                "cycle_ok": False,
-                "failed_peak_detection": True,
-                "failed_peak3_middle_third": True,
-                "failed_peak34_rvp1_negative": False,
-            },
-            None,
-        )
 
     if require_peak34_rvp1_negative and not _peaks34_rvp1_negative(rvp1, peak3_idx, peak4_idx):
         return (
@@ -385,7 +425,6 @@ def analyze_one_cycle(
         )
 
     idx_max_dp = int(np.argmax(rvp1))
-    idx_min_dp = int(np.argmin(rvp1))
 
     # Landmarks (times in seconds)
     t_peak1 = t[peak1_idx]
@@ -596,8 +635,7 @@ def run_analysis(
     verbose: bool = False,
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
     rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
-    require_peak3_middle_third: bool = True,
-    require_peak34_rvp1_negative: bool = True,
+    require_peak34_rvp1_negative: bool = False,
 ) -> int:
     """Load HDF5, run full pipeline, write CSV and PNGs. Returns 0 on success."""
     if co_method.upper() == "TDCO":
@@ -691,7 +729,6 @@ def run_analysis(
             co_l_per_min,
             deriv_smooth=deriv_smooth,
             rvp2_sq_spectral=rvp2_sq_spectral,
-            require_peak3_middle_third=require_peak3_middle_third,
             require_peak34_rvp1_negative=require_peak34_rvp1_negative,
         )
         row["cycle"] = cycle_num
@@ -815,14 +852,9 @@ def main() -> int:
         help=f"Spectral smoother: symmetric pad length at each edge. Default: {ECG_PAD_LEN} (same as ECG path)",
     )
     parser.add_argument(
-        "--disable-peak3-middle-third",
+        "--enable-peak34-negative-rvp1",
         action="store_true",
-        help="Disable requirement that the 3rd RVP''² peak (time-ordered) lies in the middle third of the cycle",
-    )
-    parser.add_argument(
-        "--disable-peak34-negative-rvp1",
-        action="store_true",
-        help="Disable requirement that the 3rd and 4th RVP''² peaks occur where RVP' is negative",
+        help="Require RVP'<0 at the 3rd and 4th RVP''² peaks (optional; regional search is the default)",
     )
     args = parser.parse_args()
     h5_path = args.h5_path.resolve()
@@ -851,8 +883,7 @@ def main() -> int:
         verbose=args.verbose,
         deriv_smooth=deriv_cfg,
         rvp2_sq_spectral=rvp2_sq_cfg,
-        require_peak3_middle_third=not args.disable_peak3_middle_third,
-        require_peak34_rvp1_negative=not args.disable_peak34_negative_rvp1,
+        require_peak34_rvp1_negative=args.enable_peak34_negative_rvp1,
     )
 
 

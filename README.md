@@ -174,21 +174,21 @@ After derivative smoothing (if any) and squaring RVP″, you can apply a **secon
 
 Very short cycles may skip spectral smoothing with a stderr warning and use unsmoothed \((\mathrm{RVP}'')^2\).
 
-### 3rd RVP''² peak in the middle third (default)
+### Regional search for four \((\mathrm{RVP}'')^2\) peaks (default)
 
-Among the four largest peaks on \((\mathrm{RVP}'')^2\) (sorted in **time order**), the **third** peak (the middle one in time) must fall in the **middle third** of the cycle’s sample indices. If not, that beat is marked as failed peak detection (`failed_peak3_middle_third` is true in the CSV). This is **on** by default.
+Peaks are **not** chosen as the four largest maxima on the whole beat. Instead, `peakutils` is run in three windows (with indices mapped back to the full cycle):
+
+1. **Peaks 1 and 2** — only within the **first third** of samples, \([0, n/3)\): the **two highest** \((\mathrm{RVP}'')^2\) values among detected peaks there, ordered in time.
+2. **Peak 3** — in \([n/3, i_{\min dP/dt}-1]\) where \(i_{\min dP/dt} = \arg\min(\mathrm{RVP}')\) (disjoint from peak 4). The **largest** remaining peak in that window.
+3. **Peak 4** — in \([i_{\min dP/dt}, i_{\min P}]\) where \(i_{\min P} = \arg\min(\mathrm{RVP})\). The **largest** peak in that window.
+
+All four indices must be strictly increasing. If any window has no peak or ordering fails, the beat is rejected (`failed_peak_detection`). The CSV column `failed_peak3_middle_third` is kept for compatibility and is **always false** with this algorithm.
+
+### Optional: negative RVP' at peaks 3 and 4
 
 | Flag | Meaning |
 |------|---------|
-| `--disable-peak3-middle-third` | Turn off this requirement (restores behavior closer to older versions that did not check peak position). |
-
-### 3rd and 4th RVP''² peaks with negative RVP' (default)
-
-The **3rd** and **4th** peaks in time order (among the four selected on \((\mathrm{RVP}'')^2\)) must occur where **RVP'** is **strictly negative** (`rvp1[peak_idx] < 0`). If not, the beat fails peak detection and `failed_peak34_rvp1_negative` is true in the CSV. This is **on** by default.
-
-| Flag | Meaning |
-|------|---------|
-| `--disable-peak34-negative-rvp1` | Turn off this requirement. |
+| `--enable-peak34-negative-rvp1` | Additionally require \(\mathrm{RVP}' < 0\) at the 3rd and 4th peaks; otherwise set `failed_peak34_rvp1_negative` and reject the beat. **Off** by default (regional windows already bias peaks appropriately). |
 
 ### HDF5 inputs the script expects
 
@@ -233,7 +233,7 @@ python scripts/analyze_rv_pressure.py hdf5_files/TRM127-RHC1.h5 --co-method TDCO
 | Analysis: no valid cycles | R–R outside 0.4–1.5 s, or too few R-peaks; check ECG quality and `--ecg-lead`. |
 | Derivative smoothing warnings | Short segments may skip Savitzky–Golay or Kalman; warnings go to stderr. |
 | Spectral \((\mathrm{RVP}'')^2\) warnings | Very short cycles or invalid fraction/pad; falls back to unsmoothed \((\mathrm{RVP}'')^2\). |
-| Many cycles fail `failed_peak3_middle_third` | Third \((\mathrm{RVP}'')^2\) peak not in middle third of beat; try `--disable-peak3-middle-third` or improve signals / smoothing. |
-| Many cycles fail `failed_peak34_rvp1_negative` | 3rd/4th peaks not on negative RVP'; try `--disable-peak34-negative-rvp1` or adjust derivative smoothing. |
+| Many cycles fail peak detection | Empty regional window (e.g. \(\arg\min \mathrm{RVP}'\) too early) or not enough peaks in the first third; try `--deriv-smooth` / `--rvp2-sq-spectral` or relax with fewer constraints. |
+| Many cycles fail `failed_peak34_rvp1_negative` | Only if you used `--enable-peak34-negative-rvp1`; otherwise leave that flag off. |
 
 For full behavior (filters, peak rules, and metric definitions), see the docstrings and constants in `scripts/analyze_rv_pressure.py`.
