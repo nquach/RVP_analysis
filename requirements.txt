@@ -1,0 +1,10 @@
+wfdb
+h5py
+neurokit2
+tsmoothie
+peakutils
+scipy
+numpy
+matplotlib
+pandas
+tqdm
