@@ -198,7 +198,7 @@ All four indices must be strictly increasing. If any window has no peak or order
 ### Outputs
 
 - **`csv_files/{stem}.csv`**: one row per cardiac cycle attempt with columns such as cycle index, `cycle_ok`, `failed_peak_detection`, `failed_peak3_middle_third`, `failed_peak34_rvp1_negative`, hemodynamic intervals, volumes/pressures where fitted, and metadata (`CO_method`, `CO_L_per_min`, etc.).
-- **`png_files/{stem}_{n}.png`**: four stacked waveform panels (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks, and the selected **ECG lead** for that cycle) plus a **text block** below in **three columns** with larger monospace text, listing the same per-cycle metrics and CO inputs for cycles with `cycle_ok` True.
+- **`png_files/{stem}_{n}.png`**: four stacked waveform panels (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks, and the selected **ECG lead** for that cycle) plus a **text block** below in **three columns** with larger monospace text. The text lists hemodynamic metrics and CO inputs **with units** (status columns such as `cycle_ok` / `failed_*` are omitted; they remain in the CSV).
 
 ---
 

@@ -360,6 +360,11 @@ def _fit_pmax_ivct_ivrt(
         return np.nan, None, None
 
 
+# Keep b*max(esv,edv) below ~700 so np.exp does not overflow float64 (~709).
+_BETA_BRENTQ_HI_MAX = 10.0
+_BETA_EXP_ARG_CAP = 700.0
+
+
 def _solve_beta(esv: float, edv: float, edp_minus_bdp_plus_1: float) -> Optional[float]:
     """
     Solve for beta so P(V)=K*(exp(beta*V)-1) passes through (0,0), (ESV,1), (EDV, EDP-BDP+1)
@@ -371,9 +376,14 @@ def _solve_beta(esv: float, edv: float, edp_minus_bdp_plus_1: float) -> Optional
     def eq(b: float) -> float:
         return edp_minus_bdp_plus_1 * (np.exp(b * esv) - 1) - (np.exp(b * edv) - 1)
 
+    b_lo = 1e-6
+    vmax = max(esv, edv)
+    b_hi = min(_BETA_BRENTQ_HI_MAX, _BETA_EXP_ARG_CAP / vmax)
+    if b_hi <= b_lo:
+        return None
+
     try:
-        # beta positive, typically small
-        beta = brentq(eq, 1e-6, 10.0)
+        beta = brentq(eq, b_lo, b_hi)
         return float(beta)
     except Exception:
         return None
@@ -537,45 +547,46 @@ def segment_pressure_by_rr_with_fs(
     return segments
 
 
-_METRIC_KEYS_PNG: tuple[str, ...] = (
-    "cycle",
-    "CO_method",
-    "CO_L_per_min",
-    "cycle_ok",
-    "failed_peak_detection",
-    "failed_peak3_middle_third",
-    "failed_peak34_rvp1_negative",
-    "RR_interval_sec",
-    "HR",
-    "IVCT",
-    "ET",
-    "IVRT",
-    "ESP",
-    "BDP",
-    "EDP",
-    "Pmax",
-    "SV",
-    "ESV",
-    "EDV",
-    "Ees",
-    "Ea",
-    "RVEF_pct",
-    "RVMPI",
-    "beta",
-    "Eed",
+# Keys and unit suffixes for diagnostic PNG text (status flags omitted).
+_PNG_METRIC_KEYS_UNITS: tuple[tuple[str, str], ...] = (
+    ("cycle", ""),
+    ("CO_method", ""),
+    ("CO_L_per_min", "L/min"),
+    ("RR_interval_sec", "sec"),
+    ("HR", "bpm"),
+    ("IVCT", "sec"),
+    ("ET", "sec"),
+    ("IVRT", "sec"),
+    ("ESP", "mmHg"),
+    ("BDP", "mmHg"),
+    ("EDP", "mmHg"),
+    ("Pmax", "mmHg"),
+    ("SV", "mL"),
+    ("ESV", "mL"),
+    ("EDV", "mL"),
+    ("Ees", "mmHg/mL"),
+    ("Ea", "mmHg/mL"),
+    ("RVEF_pct", "%"),
+    ("RVMPI", ""),
+    ("beta", "1/mL"),
+    ("Eed", "mmHg/mL"),
 )
 
 
 def _metric_lines_for_png(row: dict[str, Any]) -> list[str]:
     lines: list[str] = []
-    for k in _METRIC_KEYS_PNG:
+    for k, unit in _PNG_METRIC_KEYS_UNITS:
         if k not in row:
             continue
         v = row[k]
         if v is None or (isinstance(v, (float, np.floating)) and np.isnan(float(v))):
             lines.append(f"{k}: N/A")
         elif isinstance(v, (float, np.floating)):
-            lines.append(f"{k}: {float(v):.5g}")
+            num = float(v)
+            if unit:
+                lines.append(f"{k}: {num:.5g} {unit}")
+            else:
+                lines.append(f"{k}: {num:.5g}")
         else:
             lines.append(f"{k}: {v}")
     return lines
@@ -602,7 +613,7 @@ def save_diagnostic_plot(
     metrics_row: dict[str, Any],
     ecg_lead_name: str,
 ) -> None:
-    """Save diagnostic plot: RVP (+ sine), RVP', RVP''², ECG; metrics in three columns below."""
+    """Save diagnostic plot: RVP (+ sine, ESP/BDP/EDP markers), RVP', RVP''² (IVCT/ET/IVRT spans), ECG; metrics below."""
     t, rvp, rvp1, rvp2_sq, peaks, pmax, t_fit, p_fit, idx_max_dp, idx_min_dp, ecg_seg = plot_data
     fig = plt.figure(figsize=(8, 12), layout="constrained")
     gs = fig.add_gridspec(5, 1, height_ratios=[3.0, 3.0, 3.0, 2.5, 2.2])
@@ -623,14 +634,31 @@ def save_diagnostic_plot(
     ax5.text(0.02, 0.98, col1, **_txt_kw)
     ax5.text(0.35, 0.98, col2, **_txt_kw)
     ax5.text(0.68, 0.98, col3, **_txt_kw)
-    ax1.plot(t, rvp, "b-", label="RV pressure")
+
+    peak1_idx = int(peaks[0])
+    peak3_idx = int(peaks[2])
+    peak4_idx = int(peaks[3])
+    edp_idx = len(rvp) - 1
+    t_p1 = t[peak1_idx]
+    t_mx = t[idx_max_dp]
+    t_mn = t[idx_min_dp]
+    t_p4 = t[peak4_idx]
+
+    ax1.plot(t, rvp, "b-", label="RV pressure", zorder=3)
     if t_fit is not None and p_fit is not None:
-        ax1.plot(t_fit, p_fit, "r--", alpha=0.8, label="Sine fit (IVCT+IVRT)")
+        ax1.plot(t_fit, p_fit, "r--", alpha=0.8, label="Sine fit (IVCT+IVRT)", zorder=2)
     if not np.isnan(pmax):
-        ax1.axhline(pmax, color="gray", linestyle=":", alpha=0.8)
+        ax1.axhline(pmax, color="gray", linestyle=":", alpha=0.8, zorder=1)
         ax1.text(t[-1] * 0.95, pmax, f"Pmax={pmax:.1f}", va="bottom", ha="right", fontsize=8)
+    for name, idx, c in (
+        ("ESP", peak3_idx, "C1"),
+        ("BDP", peak4_idx, "C2"),
+        ("EDP", edp_idx, "C3"),
+    ):
+        ax1.axvline(t[idx], color=c, linestyle="--", alpha=0.85, linewidth=1.0, label=name, zorder=4)
+        ax1.plot(t[idx], rvp[idx], "o", color=c, markersize=5, zorder=6, markeredgecolor="k", markeredgewidth=0.4)
     ax1.set_ylabel("Pressure (mmHg)")
-    ax1.legend(loc="upper right", fontsize=7)
+    ax1.legend(loc="upper right", fontsize=7, ncol=2)
     ax1.set_title(f"Cycle {cycle_num}: RV pressure")
     ax1.grid(True, alpha=0.3)
 
@@ -639,10 +667,16 @@ def save_diagnostic_plot(
     ax2.set_title("First derivative")
     ax2.grid(True, alpha=0.3)
 
-    ax3.plot(t, rvp2_sq, "m-")
+    if t_p1 < t_mx:
+        ax3.axvspan(t_p1, t_mx, alpha=0.22, color="tab:blue", zorder=0, label="IVCT")
+    if t_mx < t_mn:
+        ax3.axvspan(t_mx, t_mn, alpha=0.22, color="tab:green", zorder=0, label="ET")
+    if t_mn < t_p4:
+        ax3.axvspan(t_mn, t_p4, alpha=0.22, color="tab:orange", zorder=0, label="IVRT")
+    ax3.plot(t, rvp2_sq, "m-", zorder=2)
     ax3.scatter(t[peaks], rvp2_sq[peaks], c="red", s=30, zorder=5, label="Peaks")
     ax3.set_ylabel("RVP''²")
-    ax3.set_title("Squared second derivative")
+    ax3.set_title("Squared second derivative (IVCT / ET / IVRT)")
     ax3.legend(loc="upper right", fontsize=7)
     ax3.grid(True, alpha=0.3)
 
