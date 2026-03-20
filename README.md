@@ -107,7 +107,7 @@ If a scalar is missing, the script still runs but may omit the corresponding HDF
 2. Requires ECG and pressure traces to have the **same length** (as produced by extraction).
 3. Detects **R-waves** on the ECG (NeuroKit2 + spectral smoothing, same general idea as a “TEE_optical_flow” style pipeline).
 4. Segments **RHC_pressure** into cycles between consecutive R-peaks, keeping only segments whose R–R interval is between **0.4 s and 1.5 s** (configurable in code as `RR_MIN_SEC` / `RR_MAX_SEC`).
-5. For each retained cycle, computes time-domain and model-based metrics (e.g. IVCT, ET, IVRT, ESP, pressures, P–V style quantities such as Ees, Ea, RVEF, RVMPI, beta, Eed where applicable).
+5. For each retained cycle, computes time-domain and model-based metrics (e.g. IVCT, ET, IVRT, ESP, pressures, P–V style quantities such as Ees, Ea, RVEF, RVMPI, beta, Eed where applicable). Diastolic stiffness (beta, Eed) uses an exponential P(V) through (0,0), (ESV,1), and (EDV, EDP−BDP+1).
 6. Optionally **smooths RVP′ and RVP″** (first and second time derivatives of pressure) **before** peak detection on \((\mathrm{RVP}'')^2\) and before extrema of RVP′ — see **Derivative smoothing** below.
 7. Writes one **CSV** with all cycles (successful and failed) and **PNG** diagnostics for cycles that completed successfully.
 
@@ -198,7 +198,7 @@ All four indices must be strictly increasing. If any window has no peak or order
 ### Outputs
 
 - **`csv_files/{stem}.csv`**: one row per cardiac cycle attempt with columns such as cycle index, `cycle_ok`, `failed_peak_detection`, `failed_peak3_middle_third`, `failed_peak34_rvp1_negative`, hemodynamic intervals, volumes/pressures where fitted, and metadata (`CO_method`, `CO_L_per_min`, etc.).
-- **`png_files/{stem}_{n}.png`**: three stacked waveform panels (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks) plus a **text block under the plots** listing the same per-cycle metrics and CO inputs for cycles with `cycle_ok` True.
+- **`png_files/{stem}_{n}.png`**: four stacked waveform panels (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks, and the selected **ECG lead** for that cycle) plus a **text block** below in **three columns** with larger monospace text, listing the same per-cycle metrics and CO inputs for cycles with `cycle_ok` True.
 
 ---
 

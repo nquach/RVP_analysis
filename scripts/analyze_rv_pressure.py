@@ -5,7 +5,8 @@ Analyze RV pressure time series from HDF5: ECG-gated cardiac cycles and PV-loop 
 Reads user-specified HDF5 (ECG Lead II + RHC_pressure), detects R-waves (TEE_optical_flow style),
 segments RV pressure into R-R intervals, and computes per-cycle Ees, Ea, RVEF, Eed, RVMPI, beta, etc.
 Four (RVP'')² peaks are found in fixed regions of each beat (first third; then to argmin RVP'; then to argmin RVP).
-Writes csv_files/{basename}.csv and png_files/{basename}_{cycle}.png.
+Diastolic stiffness (beta, Eed) uses an exponential P(V) through (0,0), (ESV,1), and (EDV, EDP−BDP+1).
+Writes csv_files/{basename}.csv and png_files/{basename}_{cycle}.png (RVP, RVP′, (RVP′′)², ECG, metrics in three columns).
 
 Usage:
     python scripts/analyze_rv_pressure.py path/to/file.h5 [--co-method TDCO|Fick_CO] [--output-dir DIR]
@@ -359,13 +360,16 @@ def _fit_pmax_ivct_ivrt(
         return np.nan, None, None
 
 
-def _solve_beta(esv: float, edv: float, edp_plus_bdp_plus_1: float) -> Optional[float]:
-    """Solve (EDP+BDP+1)*(exp(beta*ESV)-1) = exp(beta*EDV)-1 for beta."""
-    if esv <= 0 or edv <= esv or edp_plus_bdp_plus_1 <= 0:
+def _solve_beta(esv: float, edv: float, edp_minus_bdp_plus_1: float) -> Optional[float]:
+    """
+    Solve for beta so P(V)=K*(exp(beta*V)-1) passes through (0,0), (ESV,1), (EDV, EDP-BDP+1)
+    with K=1/(exp(beta*ESV)-1), i.e. (EDP-BDP+1)*(exp(beta*ESV)-1) = (exp(beta*EDV)-1).
+    """
+    if esv <= 0 or edv <= esv or edp_minus_bdp_plus_1 <= 0:
         return None
 
     def eq(b: float) -> float:
-        return (edp_plus_bdp_plus_1) * (np.exp(b * esv) - 1) - (np.exp(b * edv) - 1)
+        return edp_minus_bdp_plus_1 * (np.exp(b * esv) - 1) - (np.exp(b * edv) - 1)
 
     try:
         # beta positive, typically small
@@ -377,6 +381,7 @@ def _solve_beta(esv: float, edv: float, edp_plus_bdp_plus_1: float) -> Optional[
 
 def analyze_one_cycle(
     rvp: np.ndarray,
+    ecg_seg: np.ndarray,
     t: np.ndarray,
     rr_sec: float,
     fs: float,
@@ -387,7 +392,8 @@ def analyze_one_cycle(
 ) -> tuple[dict[str, Any], Optional[tuple]]:
     """
     Compute all metrics for one cardiac cycle. Returns (row_dict, plot_data).
-    plot_data is (t, rvp, rvp1, rvp2_sq, peak_indices, pmax, t_fit, p_fit) for plotting.
+    plot_data is (t, rvp, rvp1, rvp2_sq, peak_indices, pmax, t_fit, p_fit, idx_max_dp,
+    idx_min_dp, ecg_seg) for plotting; ecg_seg matches rvp length.
     """
     cfg = deriv_smooth if deriv_smooth is not None else DerivativeSmoothConfig()
     rvp1, rvp2 = _derivatives(rvp, t)
@@ -465,8 +471,8 @@ def analyze_one_cycle(
     beta_val = np.nan
     eed_val = np.nan
     if not (np.isnan(esv) or np.isnan(edv) or np.isnan(edp) or np.isnan(bdp)):
-        edp_bdp_1 = edp + bdp + 1.0
-        beta_val = _solve_beta(esv, edv, edp_bdp_1)
+        edp_minus_bdp_plus_1 = edp - bdp + 1.0
+        beta_val = _solve_beta(esv, edv, edp_minus_bdp_plus_1)
         if beta_val is not None:
             alpha = 1.0 / (np.exp(beta_val * esv) - 1.0)
             eed_val = alpha * beta_val * np.exp(beta_val * edv)
@@ -506,60 +512,63 @@ def analyze_one_cycle(
         p_fit,
         idx_max_dp,
         idx_min_dp,
+        ecg_seg,
     )
     return row, plot_data
 
 
 def segment_pressure_by_rr_with_fs(
-    pressure: np.ndarray, r_peaks: np.ndarray, fs: float
-) -> list[tuple[np.ndarray, np.ndarray, float]]:
-    """Segment RV pressure into cycles; time in seconds, RR in seconds."""
-    segments: list[tuple[np.ndarray, np.ndarray, float]] = []
+    pressure: np.ndarray, ecg: np.ndarray, r_peaks: np.ndarray, fs: float
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float]]:
+    """Segment RV pressure and ECG into aligned cycles; time in seconds, RR in seconds."""
+    segments: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
     for i in range(len(r_peaks) - 1):
         start = int(r_peaks[i])
         end = int(r_peaks[i + 1])
         seg = pressure[start:end]
+        ecg_seg = ecg[start:end]
         if seg.size < 10:
             continue
         rr_sec = (end - start) / fs
         if rr_sec < RR_MIN_SEC or rr_sec > RR_MAX_SEC:
             continue
         t = np.arange(seg.size, dtype=float) / fs
-        segments.append((seg, t, rr_sec))
+        segments.append((seg, ecg_seg, t, rr_sec))
     return segments
 
 
-def _format_metrics_row(row: dict[str, Any]) -> str:
-    """Multi-line text for diagnostic PNG from per-cycle CSV row."""
-    keys = [
-        "cycle",
-        "CO_method",
-        "CO_L_per_min",
-        "cycle_ok",
-        "failed_peak_detection",
-        "failed_peak3_middle_third",
-        "failed_peak34_rvp1_negative",
-        "RR_interval_sec",
-        "HR",
-        "IVCT",
-        "ET",
-        "IVRT",
-        "ESP",
-        "BDP",
-        "EDP",
-        "Pmax",
-        "SV",
-        "ESV",
-        "EDV",
-        "Ees",
-        "Ea",
-        "RVEF_pct",
-        "RVMPI",
-        "beta",
-        "Eed",
-    ]
+_METRIC_KEYS_PNG: tuple[str, ...] = (
+    "cycle",
+    "CO_method",
+    "CO_L_per_min",
+    "cycle_ok",
+    "failed_peak_detection",
+    "failed_peak3_middle_third",
+    "failed_peak34_rvp1_negative",
+    "RR_interval_sec",
+    "HR",
+    "IVCT",
+    "ET",
+    "IVRT",
+    "ESP",
+    "BDP",
+    "EDP",
+    "Pmax",
+    "SV",
+    "ESV",
+    "EDV",
+    "Ees",
+    "Ea",
+    "RVEF_pct",
+    "RVMPI",
+    "beta",
+    "Eed",
+)
+
+
+def _metric_lines_for_png(row: dict[str, Any]) -> list[str]:
     lines: list[str] = []
-    for k in keys:
+    for k in _METRIC_KEYS_PNG:
         if k not in row:
             continue
         v = row[k]
@@ -569,7 +578,21 @@ def _format_metrics_row(row: dict[str, Any]) -> str:
             lines.append(f"{k}: {float(v):.5g}")
         else:
             lines.append(f"{k}: {v}")
-    return "\n".join(lines)
+    return lines
+
+
+def _format_metrics_three_columns(row: dict[str, Any]) -> tuple[str, str, str]:
+    """Metrics text split into three columns for diagnostic PNG."""
+    lines = _metric_lines_for_png(row)
+    n = len(lines)
+    if n == 0:
+        return "", "", ""
+    n1 = (n + 2) // 3
+    rest = n - n1
+    n2 = (rest + 1) // 2
+    i1 = n1
+    i2 = i1 + n2
+    return "\n".join(lines[:i1]), "\n".join(lines[i1:i2]), "\n".join(lines[i2:])
 
 
 def save_diagnostic_plot(
@@ -577,26 +600,29 @@ def save_diagnostic_plot(
     save_path: Path,
     cycle_num: int,
     metrics_row: dict[str, Any],
+    ecg_lead_name: str,
 ) -> None:
-    """Save 3-panel diagnostic plot plus metrics text: RVP (+ sine), RVP', RVP''²; shared x-axis."""
-    t, rvp, rvp1, rvp2_sq, peaks, pmax, t_fit, p_fit, idx_max_dp, idx_min_dp = plot_data
-    fig = plt.figure(figsize=(8, 10), layout="constrained")
-    gs = fig.add_gridspec(4, 1, height_ratios=[3.0, 3.0, 3.0, 1.5])
+    """Save diagnostic plot: RVP (+ sine), RVP', RVP''², ECG; metrics in three columns below."""
+    t, rvp, rvp1, rvp2_sq, peaks, pmax, t_fit, p_fit, idx_max_dp, idx_min_dp, ecg_seg = plot_data
+    fig = plt.figure(figsize=(8, 12), layout="constrained")
+    gs = fig.add_gridspec(5, 1, height_ratios=[3.0, 3.0, 3.0, 2.5, 2.2])
     ax1 = fig.add_subplot(gs[0, 0])
     ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
     ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
-    ax4 = fig.add_subplot(gs[3, 0])
-    ax4.axis("off")
-    ax4.text(
-        0.0,
-        1.0,
-        _format_metrics_row(metrics_row),
-        transform=ax4.transAxes,
+    ax4 = fig.add_subplot(gs[3, 0], sharex=ax1)
+    ax5 = fig.add_subplot(gs[4, 0])
+    ax5.axis("off")
+    col1, col2, col3 = _format_metrics_three_columns(metrics_row)
+    _txt_kw = dict(
+        transform=ax5.transAxes,
         va="top",
         ha="left",
-        fontsize=6,
+        fontsize=9,
         family="monospace",
     )
+    ax5.text(0.02, 0.98, col1, **_txt_kw)
+    ax5.text(0.35, 0.98, col2, **_txt_kw)
+    ax5.text(0.68, 0.98, col3, **_txt_kw)
     ax1.plot(t, rvp, "b-", label="RV pressure")
     if t_fit is not None and p_fit is not None:
         ax1.plot(t_fit, p_fit, "r--", alpha=0.8, label="Sine fit (IVCT+IVRT)")
@@ -616,10 +642,15 @@ def save_diagnostic_plot(
     ax3.plot(t, rvp2_sq, "m-")
     ax3.scatter(t[peaks], rvp2_sq[peaks], c="red", s=30, zorder=5, label="Peaks")
     ax3.set_ylabel("RVP''²")
-    ax3.set_xlabel("Time (s, from cycle start)")
     ax3.set_title("Squared second derivative")
     ax3.legend(loc="upper right", fontsize=7)
     ax3.grid(True, alpha=0.3)
+
+    ax4.plot(t, ecg_seg, color="C0", linewidth=0.8)
+    ax4.set_ylabel("ECG")
+    ax4.set_xlabel("Time (s, from cycle start)")
+    ax4.set_title(ecg_lead_name)
+    ax4.grid(True, alpha=0.3)
 
     fig.suptitle(f"RV pressure analysis — cycle {cycle_num}", fontsize=10)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -684,7 +715,7 @@ def run_analysis(
 
     if verbose:
         print("Step 3/6: Segmenting RV pressure into R-R intervals...")
-    segments = segment_pressure_by_rr_with_fs(pressure, r_peaks, fs)
+    segments = segment_pressure_by_rr_with_fs(pressure, ecg, r_peaks, fs)
     if not segments:
         print("Error: no valid R-R segments (check RR length filters)", file=sys.stderr)
         return 1
@@ -717,12 +748,13 @@ def run_analysis(
             unit="cycle",
             desc="Cardiac cycles",
         )
-    for i, (rvp, t, rr_sec) in iterator:
+    for i, (rvp, ecg_seg, t, rr_sec) in iterator:
         cycle_num = i + 1
         if verbose and hasattr(iterator, "set_postfix"):
             iterator.set_postfix(cycle=cycle_num, RR_s=round(rr_sec, 3))
         row, plot_data = analyze_one_cycle(
             rvp,
+            ecg_seg,
             t,
             rr_sec,
             fs,
@@ -741,6 +773,7 @@ def run_analysis(
                 png_dir / f"{basename}_{cycle_num}.png",
                 cycle_num,
                 row,
+                ecg_lead_name=ecg_lead,
             )
 
     if verbose:
