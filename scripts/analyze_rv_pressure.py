@@ -11,7 +11,7 @@ Usage:
         [--deriv-smooth none|savgol|kalman] [--savgol-window N] [--savgol-polyorder P]
         [--kalman-level-noise X] [--kalman-trend-noise X] [--kalman-observation-noise X]
         [--rvp2-sq-spectral] [--rvp2-sq-spectral-fraction F] [--rvp2-sq-spectral-pad N]
-        [--disable-peak3-middle-third]
+        [--disable-peak3-middle-third] [--disable-peak34-negative-rvp1]
         [-v|--verbose]
 """
 
@@ -237,6 +237,13 @@ def _peak3_in_middle_third(peak3_idx: int, n: int) -> bool:
     return lo <= peak3_idx <= hi
 
 
+def _peaks34_rvp1_negative(rvp1: np.ndarray, peak3_idx: int, peak4_idx: int) -> bool:
+    """True if RVP' is strictly negative at the 3rd and 4th RVP''² peaks (time-ordered)."""
+    a = float(rvp1[peak3_idx])
+    b = float(rvp1[peak4_idx])
+    return a < 0.0 and b < 0.0
+
+
 def _find_four_peaks(
     rvp2_sq: np.ndarray, min_dist: int = 5, thres: float = 0.1
 ) -> Optional[np.ndarray]:
@@ -328,6 +335,7 @@ def analyze_one_cycle(
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
     rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
     require_peak3_middle_third: bool = True,
+    require_peak34_rvp1_negative: bool = True,
 ) -> tuple[dict[str, Any], Optional[tuple]]:
     """
     Compute all metrics for one cardiac cycle. Returns (row_dict, plot_data).
@@ -347,6 +355,7 @@ def analyze_one_cycle(
                 "cycle_ok": False,
                 "failed_peak_detection": True,
                 "failed_peak3_middle_third": False,
+                "failed_peak34_rvp1_negative": False,
             },
             None,
         )
@@ -359,6 +368,18 @@ def analyze_one_cycle(
                 "cycle_ok": False,
                 "failed_peak_detection": True,
                 "failed_peak3_middle_third": True,
+                "failed_peak34_rvp1_negative": False,
+            },
+            None,
+        )
+
+    if require_peak34_rvp1_negative and not _peaks34_rvp1_negative(rvp1, peak3_idx, peak4_idx):
+        return (
+            {
+                "cycle_ok": False,
+                "failed_peak_detection": True,
+                "failed_peak3_middle_third": False,
+                "failed_peak34_rvp1_negative": True,
             },
             None,
         )
@@ -415,6 +436,7 @@ def analyze_one_cycle(
         "cycle_ok": True,
         "failed_peak_detection": False,
         "failed_peak3_middle_third": False,
+        "failed_peak34_rvp1_negative": False,
         "RR_interval_sec": rr_sec,
         "HR": hr,
         "IVCT": ivct,
@@ -477,6 +499,7 @@ def _format_metrics_row(row: dict[str, Any]) -> str:
         "cycle_ok",
         "failed_peak_detection",
         "failed_peak3_middle_third",
+        "failed_peak34_rvp1_negative",
         "RR_interval_sec",
         "HR",
         "IVCT",
@@ -574,6 +597,7 @@ def run_analysis(
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
     rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
     require_peak3_middle_third: bool = True,
+    require_peak34_rvp1_negative: bool = True,
 ) -> int:
     """Load HDF5, run full pipeline, write CSV and PNGs. Returns 0 on success."""
     if co_method.upper() == "TDCO":
@@ -668,6 +692,7 @@ def run_analysis(
             deriv_smooth=deriv_smooth,
             rvp2_sq_spectral=rvp2_sq_spectral,
             require_peak3_middle_third=require_peak3_middle_third,
+            require_peak34_rvp1_negative=require_peak34_rvp1_negative,
         )
         row["cycle"] = cycle_num
         row["CO_method"] = co_method
@@ -794,6 +819,11 @@ def main() -> int:
         action="store_true",
         help="Disable requirement that the 3rd RVP''² peak (time-ordered) lies in the middle third of the cycle",
     )
+    parser.add_argument(
+        "--disable-peak34-negative-rvp1",
+        action="store_true",
+        help="Disable requirement that the 3rd and 4th RVP''² peaks occur where RVP' is negative",
+    )
     args = parser.parse_args()
     h5_path = args.h5_path.resolve()
     if not h5_path.is_file():
@@ -822,6 +852,7 @@ def main() -> int:
         deriv_smooth=deriv_cfg,
         rvp2_sq_spectral=rvp2_sq_cfg,
         require_peak3_middle_third=not args.disable_peak3_middle_third,
+        require_peak34_rvp1_negative=not args.disable_peak34_negative_rvp1,
     )
 
 

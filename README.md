@@ -182,6 +182,14 @@ Among the four largest peaks on \((\mathrm{RVP}'')^2\) (sorted in **time order**
 |------|---------|
 | `--disable-peak3-middle-third` | Turn off this requirement (restores behavior closer to older versions that did not check peak position). |
 
+### 3rd and 4th RVP''² peaks with negative RVP' (default)
+
+The **3rd** and **4th** peaks in time order (among the four selected on \((\mathrm{RVP}'')^2\)) must occur where **RVP'** is **strictly negative** (`rvp1[peak_idx] < 0`). If not, the beat fails peak detection and `failed_peak34_rvp1_negative` is true in the CSV. This is **on** by default.
+
+| Flag | Meaning |
+|------|---------|
+| `--disable-peak34-negative-rvp1` | Turn off this requirement. |
+
 ### HDF5 inputs the script expects
 
 - Datasets: `--ecg-lead` (default `ECG_lead_II`) and **`RHC_pressure`**.
@@ -189,7 +197,7 @@ Among the four largest peaks on \((\mathrm{RVP}'')^2\) (sorted in **time order**
 
 ### Outputs
 
-- **`csv_files/{stem}.csv`**: one row per cardiac cycle attempt with columns such as cycle index, `cycle_ok`, `failed_peak_detection`, `failed_peak3_middle_third`, hemodynamic intervals, volumes/pressures where fitted, and metadata (`CO_method`, `CO_L_per_min`, etc.).
+- **`csv_files/{stem}.csv`**: one row per cardiac cycle attempt with columns such as cycle index, `cycle_ok`, `failed_peak_detection`, `failed_peak3_middle_third`, `failed_peak34_rvp1_negative`, hemodynamic intervals, volumes/pressures where fitted, and metadata (`CO_method`, `CO_L_per_min`, etc.).
 - **`png_files/{stem}_{n}.png`**: three stacked waveform panels (RV pressure + optional sine fit, RVP′, \((\mathrm{RVP}'')^2\) with detected peaks) plus a **text block under the plots** listing the same per-cycle metrics and CO inputs for cycles with `cycle_ok` True.
 
 ---
@@ -226,5 +234,6 @@ python scripts/analyze_rv_pressure.py hdf5_files/TRM127-RHC1.h5 --co-method TDCO
 | Derivative smoothing warnings | Short segments may skip Savitzky–Golay or Kalman; warnings go to stderr. |
 | Spectral \((\mathrm{RVP}'')^2\) warnings | Very short cycles or invalid fraction/pad; falls back to unsmoothed \((\mathrm{RVP}'')^2\). |
 | Many cycles fail `failed_peak3_middle_third` | Third \((\mathrm{RVP}'')^2\) peak not in middle third of beat; try `--disable-peak3-middle-third` or improve signals / smoothing. |
+| Many cycles fail `failed_peak34_rvp1_negative` | 3rd/4th peaks not on negative RVP'; try `--disable-peak34-negative-rvp1` or adjust derivative smoothing. |
 
 For full behavior (filters, peak rules, and metric definitions), see the docstrings and constants in `scripts/analyze_rv_pressure.py`.
