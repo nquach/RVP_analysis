@@ -160,6 +160,20 @@ Tuning flags (only affect the corresponding method):
 python scripts/analyze_rv_pressure.py hdf5_files/TRM127-RHC1.h5 --deriv-smooth savgol --savgol-window 15 --savgol-polyorder 3 -v
 ```
 
+### Spectral smoothing of \((\mathrm{RVP}'')^2\) (`--rvp2-sq-spectral`)
+
+After derivative smoothing (if any) and squaring RVP″, you can apply a **second** stage: FFT-based **spectral smoothing** (`tsmoothie.SpectralSmoother`, same family as the ECG path) **only** to the \((\mathrm{RVP}'')^2\) trace, immediately **before** `peakutils` peak picking. This is off by default.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--rvp2-sq-spectral` | off | Enable spectral smoothing of \((\mathrm{RVP}'')^2\). |
+| `--rvp2-sq-spectral-fraction` | `0.2` | Fraction of FFT frequencies kept; must be in `(0, 1)` (same default as ECG spectral smoothing). |
+| `--rvp2-sq-spectral-pad` | `20` | Symmetric padding length at each edge (same default as ECG). |
+
+**Recommended workflow** for cleaner peaks: combine derivative smoothing with this flag, e.g. `--deriv-smooth savgol --rvp2-sq-spectral` (or `kalman` instead of `savgol`). You can also enable `--rvp2-sq-spectral` with `--deriv-smooth none` to smooth only the squared second derivative.
+
+Very short cycles may skip spectral smoothing with a stderr warning and use unsmoothed \((\mathrm{RVP}'')^2\).
+
 ### HDF5 inputs the script expects
 
 - Datasets: `--ecg-lead` (default `ECG_lead_II`) and **`RHC_pressure`**.
@@ -202,5 +216,6 @@ python scripts/analyze_rv_pressure.py hdf5_files/TRM127-RHC1.h5 --co-method TDCO
 | Analysis: missing CO attribute | Use `--co-method` that matches an attribute you actually wrote (e.g. Fick vs TDCO). |
 | Analysis: no valid cycles | R–R outside 0.4–1.5 s, or too few R-peaks; check ECG quality and `--ecg-lead`. |
 | Derivative smoothing warnings | Short segments may skip Savitzky–Golay or Kalman; warnings go to stderr. |
+| Spectral \((\mathrm{RVP}'')^2\) warnings | Very short cycles or invalid fraction/pad; falls back to unsmoothed \((\mathrm{RVP}'')^2\). |
 
 For full behavior (filters, peak rules, and metric definitions), see the docstrings and constants in `scripts/analyze_rv_pressure.py`.

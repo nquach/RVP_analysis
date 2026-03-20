@@ -10,6 +10,7 @@ Usage:
     python scripts/analyze_rv_pressure.py path/to/file.h5 [--co-method TDCO|Fick_CO] [--output-dir DIR]
         [--deriv-smooth none|savgol|kalman] [--savgol-window N] [--savgol-polyorder P]
         [--kalman-level-noise X] [--kalman-trend-noise X] [--kalman-observation-noise X]
+        [--rvp2-sq-spectral] [--rvp2-sq-spectral-fraction F] [--rvp2-sq-spectral-pad N]
         [-v|--verbose]
 """
 
@@ -68,6 +69,15 @@ class DerivativeSmoothConfig:
     kalman_level_noise: float = DEFAULT_KALMAN_LEVEL_NOISE
     kalman_trend_noise: float = DEFAULT_KALMAN_TREND_NOISE
     kalman_observation_noise: float = DEFAULT_KALMAN_OBSERVATION_NOISE
+
+
+@dataclass(frozen=True)
+class Rvp2SqSpectralConfig:
+    """Optional FFT-domain spectral smoothing of (RVP'')^2 after squaring, before peak picking."""
+
+    enabled: bool = False
+    smooth_fraction: float = ECG_SMOOTH_FRACTION
+    pad_len: int = ECG_PAD_LEN
 
 
 def get_project_root() -> Path:
@@ -174,6 +184,47 @@ def _smooth_derivatives(
     raise ValueError(f"Unknown derivative smooth method: {cfg.method!r}")
 
 
+def _spectral_smooth_rvp2_sq(
+    rvp2_sq: np.ndarray, smooth_fraction: float, pad_len: int
+) -> np.ndarray:
+    """
+    Apply SpectralSmoother to (RVP'')^2 for peak picking; on failure return input unchanged.
+    """
+    x = np.asarray(rvp2_sq, dtype=float)
+    if x.size < 3:
+        print(
+            "Warning: segment too short for spectral RVP''² smoothing; using unsmoothed (RVP'')².",
+            file=sys.stderr,
+        )
+        return x
+    if not (0 < smooth_fraction < 1) or pad_len < 1:
+        print(
+            "Warning: invalid spectral RVP''² parameters; using unsmoothed (RVP'')².",
+            file=sys.stderr,
+        )
+        return x
+    if x.size <= 2 * pad_len:
+        print(
+            "Warning: segment too short for spectral RVP''² padding; using unsmoothed (RVP'')².",
+            file=sys.stderr,
+        )
+        return x
+    try:
+        smoother = SpectralSmoother(smooth_fraction=smooth_fraction, pad_len=pad_len)
+        smoother.smooth(x)
+        out = np.asarray(smoother.smooth_data[0], dtype=float)
+        out = np.squeeze(out)
+        if out.shape != x.shape:
+            out = out.reshape(x.shape)
+        return out
+    except Exception as e:
+        print(
+            f"Warning: spectral RVP''² smoothing failed ({e}); using unsmoothed (RVP'')².",
+            file=sys.stderr,
+        )
+        return x
+
+
 def _find_four_peaks(
     rvp2_sq: np.ndarray, min_dist: int = 5, thres: float = 0.1
 ) -> Optional[np.ndarray]:
@@ -263,6 +314,7 @@ def analyze_one_cycle(
     fs: float,
     co_l_per_min: float,
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
+    rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
 ) -> tuple[dict[str, Any], Optional[tuple]]:
     """
     Compute all metrics for one cardiac cycle. Returns (row_dict, plot_data).
@@ -272,6 +324,9 @@ def analyze_one_cycle(
     rvp1, rvp2 = _derivatives(rvp, t)
     rvp1, rvp2 = _smooth_derivatives(rvp1, rvp2, fs, cfg)
     rvp2_sq = rvp2 ** 2
+    sq_cfg = rvp2_sq_spectral if rvp2_sq_spectral is not None else Rvp2SqSpectralConfig()
+    if sq_cfg.enabled:
+        rvp2_sq = _spectral_smooth_rvp2_sq(rvp2_sq, sq_cfg.smooth_fraction, sq_cfg.pad_len)
     peaks = _find_four_peaks(rvp2_sq)
     if peaks is None or len(peaks) < N_PEAKS_RVP2:
         return (
@@ -429,6 +484,7 @@ def run_analysis(
     ecg_lead: str,
     verbose: bool = False,
     deriv_smooth: Optional[DerivativeSmoothConfig] = None,
+    rvp2_sq_spectral: Optional[Rvp2SqSpectralConfig] = None,
 ) -> int:
     """Load HDF5, run full pipeline, write CSV and PNGs. Returns 0 on success."""
     if co_method.upper() == "TDCO":
@@ -485,6 +541,13 @@ def run_analysis(
         print("  {} cardiac cycles to analyze.".format(len(segments)))
         dcfg = deriv_smooth if deriv_smooth is not None else DerivativeSmoothConfig()
         print(f"  Derivative smoothing: {dcfg.method}.")
+        scfg = rvp2_sq_spectral if rvp2_sq_spectral is not None else Rvp2SqSpectralConfig()
+        if scfg.enabled:
+            print(
+                f"  Spectral (RVP'')² smoothing: on (fraction={scfg.smooth_fraction}, pad_len={scfg.pad_len})."
+            )
+        else:
+            print("  Spectral (RVP'')² smoothing: off.")
 
     basename = h5_path.stem
     csv_dir = output_dir / "csv_files"
@@ -508,7 +571,13 @@ def run_analysis(
         if verbose and hasattr(iterator, "set_postfix"):
             iterator.set_postfix(cycle=cycle_num, RR_s=round(rr_sec, 3))
         row, plot_data = analyze_one_cycle(
-            rvp, t, rr_sec, fs, co_l_per_min, deriv_smooth=deriv_smooth
+            rvp,
+            t,
+            rr_sec,
+            fs,
+            co_l_per_min,
+            deriv_smooth=deriv_smooth,
+            rvp2_sq_spectral=rvp2_sq_spectral,
         )
         row["cycle"] = cycle_num
         row["CO_method"] = co_method
@@ -610,6 +679,25 @@ def main() -> int:
         metavar="X",
         help=f"Kalman observation noise. Default: {DEFAULT_KALMAN_OBSERVATION_NOISE}",
     )
+    parser.add_argument(
+        "--rvp2-sq-spectral",
+        action="store_true",
+        help="Apply spectral smoothing (tsmoothie SpectralSmoother) to (RVP'')² after derivative smoothing, before peak picking",
+    )
+    parser.add_argument(
+        "--rvp2-sq-spectral-fraction",
+        type=float,
+        default=ECG_SMOOTH_FRACTION,
+        metavar="F",
+        help=f"Spectral smoother: fraction of FFT frequencies kept (0,1). Default: {ECG_SMOOTH_FRACTION} (same as ECG path)",
+    )
+    parser.add_argument(
+        "--rvp2-sq-spectral-pad",
+        type=int,
+        default=ECG_PAD_LEN,
+        metavar="N",
+        help=f"Spectral smoother: symmetric pad length at each edge. Default: {ECG_PAD_LEN} (same as ECG path)",
+    )
     args = parser.parse_args()
     h5_path = args.h5_path.resolve()
     if not h5_path.is_file():
@@ -624,6 +712,11 @@ def main() -> int:
         kalman_trend_noise=args.kalman_trend_noise,
         kalman_observation_noise=args.kalman_observation_noise,
     )
+    rvp2_sq_cfg = Rvp2SqSpectralConfig(
+        enabled=args.rvp2_sq_spectral,
+        smooth_fraction=args.rvp2_sq_spectral_fraction,
+        pad_len=args.rvp2_sq_spectral_pad,
+    )
     return run_analysis(
         h5_path,
         args.co_method,
@@ -631,6 +724,7 @@ def main() -> int:
         args.ecg_lead,
         verbose=args.verbose,
         deriv_smooth=deriv_cfg,
+        rvp2_sq_spectral=rvp2_sq_cfg,
     )
 
 
